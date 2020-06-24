@@ -237,4 +237,11 @@ namespace winrt::TerminalApp::implementation
         ToggleFullscreen();
         args.Handled(true);
     }
+
+    void TerminalPage::_HandleToggleCommandPalette(const IInspectable& /*sender*/,
+                                                   const TerminalApp::ActionEventArgs& args)
+    {
+        CommandPalette().ToggleVisibility();
+        args.Handled(true);
+    }
 }
