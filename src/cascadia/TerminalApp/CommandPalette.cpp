@@ -148,10 +148,30 @@ namespace winrt::TerminalApp::implementation
         _updateFilteredActions();
     }
 
+    // This is a helper struct to aid in sorting Commands by a given weighting.
+    struct WeightedCommand
+    {
+        TerminalApp::Command command;
+        int weight;
+
+        bool operator<(const WeightedCommand& other) const
+        {
+            return weight < other.weight;
+        }
+    };
+
+    // This is a helper to aid in sorting commands by their `Name`s, alphabetically.
+    static bool _compareCommandNames(const TerminalApp::Command& lhs, const TerminalApp::Command& rhs)
+    {
+        std::wstring_view leftName{ lhs.Name() };
+        std::wstring_view rightName{ rhs.Name() };
+        return leftName.compare(rightName) < 0;
+    }
+
     // Method Description:
     // - Update our list of filtered actions to reflect the current contents of
     //   the input box. For more details on which commands will be displayed,
-    //   see `_filterMatchesName`.
+    //   see `_getWeight`.
     // Arguments:
     // - <none>
     // Return Value:
@@ -163,12 +183,27 @@ namespace winrt::TerminalApp::implementation
         const bool addAll = searchText.empty();
 
         // If there's no filter text, then just add all the commands in order to the list.
+        // - TODO GH#6647:Possibly add the MRU commands first in order, followed
+        //   by the rest of the comamnds.
         if (addAll)
         {
+            // Add all the commands, but make sure they're sorted alphabetically.
+            std::vector<TerminalApp::Command> sortedCommands;
+            sortedCommands.reserve(_allActions.Size());
+
             for (auto action : _allActions)
+            {
+                sortedCommands.push_back(action);
+            }
+            std::sort(sortedCommands.begin(),
+                      sortedCommands.end(),
+                      _compareCommandNames);
+
+            for (auto action : sortedCommands)
             {
                 _filteredActions.Append(action);
             }
+
             return;
         }
 
@@ -178,40 +213,93 @@ namespace winrt::TerminalApp::implementation
         //   subsequent word seems better than just "the order they appear in
         //   the list".
         // - TODO GH#6647:"Recently used commands" ordering also seems valuable.
-
-        auto compare = [searchText](const Command& left, const Command& right) {
-            const int leftWeight = _getWeight(left.Name(), searchText);
-            const int rightWeight = _getWeight(right.Name(), searchText);
-            return leftWeight < rightWeight;
-        };
+        //      * This could be done by weighting the recently used commands
+        //        heigher the more recently they were used, then weighting all
+        //        the unused commands as 1
 
         // Use a priority queue to order commands so that "better" matches
         // appear first in the list. The ordering will be determined by the
         // match weight produced by _getWeight.
-        std::priority_queue<Command, std::vector<Command>, decltype(compare)> heap(compare);
+        std::priority_queue<WeightedCommand> heap;
         for (auto action : _allActions)
         {
-            if (CommandPalette::_filterMatchesName(searchText, action.Name()))
+            const auto weight = CommandPalette::_getWeight(searchText, action.Name());
+            if (weight > 0)
             {
-                heap.push(action);
+                WeightedCommand wc;
+                wc.command = action;
+                wc.weight = weight;
+                heap.push(wc);
             }
         }
+
+        // At this point, all the commands in heap are matches. We want to
+        // include all these commands, but to keep some semblance of
+        // determination, let's sort the commands with the same weight
+        // alphabetically by name. Otherwise, something like ["Switch to tab 0",
+        // "Switch to tab 1", "Switch to tab 2"] might show up in any order when
+        // popped from the top of the heap.
+        std::vector<TerminalApp::Command> currentWeightedCommands;
+        int currentWeight = 0;
+
+        // This is a helper lambda to sort all the commands currently in
+        // currentWeightedCommands, and add them into _filteredActions. It will
+        // then clear currentWeightedCommands
+        auto flushCurrentCommands = [&currentWeightedCommands, this]() {
+            std::sort(currentWeightedCommands.begin(),
+                      currentWeightedCommands.end(),
+                      _compareCommandNames);
+
+            for (auto& c : currentWeightedCommands)
+            {
+                _filteredActions.Append(c);
+            }
+            currentWeightedCommands.clear();
+        };
 
         // Remove everything in-order from the queue, and add to the list of
         // filtered actions.
         while (!heap.empty())
         {
-            _filteredActions.Append(heap.top());
+            auto top = heap.top();
             heap.pop();
+            // If we haven't inspected a command yet, set our current weight to this commands weight.
+            if (currentWeightedCommands.empty())
+            {
+                currentWeight = top.weight;
+            }
+
+            // Otherwise, if this command's weight is different, then we should
+            // flush out all the commands with the old weight, and start
+            // accumulating new commands.
+            if (top.weight != currentWeight)
+            {
+                flushCurrentCommands();
+                currentWeight = top.weight;
+            }
+
+            currentWeightedCommands.push_back(top.command);
         }
+        // If we had any leftover commands we had buffered from the heap, add them now.
+        flushCurrentCommands();
     }
 
     // Function Description:
-    // - Determine if a command with the given `name` should be shown if the
-    //   input box contains the string `searchText`. If all the characters of
-    //   search text appear in order in `name`, then this function will return
-    //   true. There can be any number of characters separating consecutive
-    //   characters in searchText.
+    // - Calculates a "weighting" by which should be used to order a command
+    //   name relative to other names, given a specific search string.
+    //   Currently, this is based off of two factors:
+    //   * The weight is incremented once for each matched character of the
+    //     search text.
+    //   * If a matching character from the search text was found at the start
+    //     of a word in the name, then we increment the weight again.
+    //     * For example, for a search string "sp", we want "Split Pane" to
+    //       appear in the list before "Close Pane"
+    //   * Consecutive matches will be weighted higher than matches with
+    //     characters in between the search characters.
+    // - This will return 0 if the command should not be shown. If all the
+    //   characters of search text appear in order in `name`, then this function
+    //   will return a positive number. There can be any number of characters
+    //   separating consecutive characters in searchText.
     //   * For example:
     //      "name": "New Tab"
     //      "name": "Close Tab"
@@ -234,77 +322,51 @@ namespace winrt::TerminalApp::implementation
     // - searchText: the string of text to search for in `name`
     // - name: the name to check
     // Return Value:
-    // - true if name contained all the characters of searchText
-    bool CommandPalette::_filterMatchesName(const winrt::hstring& searchText, const winrt::hstring& name)
-    {
-        std::wstring lowercaseSearchText{ searchText.c_str() };
-        std::wstring lowercaseName{ name.c_str() };
-        std::transform(lowercaseSearchText.begin(), lowercaseSearchText.end(), lowercaseSearchText.begin(), std::towlower);
-        std::transform(lowercaseName.begin(), lowercaseName.end(), lowercaseName.begin(), std::towlower);
-
-        const wchar_t* namePtr = lowercaseName.c_str();
-        const wchar_t* endOfName = lowercaseName.c_str() + lowercaseName.size();
-        for (const auto& wch : lowercaseSearchText)
-        {
-            while (wch != *namePtr)
-            {
-                // increment the character to look at in the name string
-                namePtr++;
-                if (namePtr >= endOfName)
-                {
-                    // If we are at the end of the name string, we haven't found all the search chars
-                    return false;
-                }
-            }
-        }
-        return true;
-    }
-
-    // Function Description:
-    // - Calculates a "weighting" by which should be used to order a command
-    //   name relative to other names, given a specific search string.
-    //   Currently, this is based off of two factors:
-    //   * The weight is incremented once for each matched character of the
-    //     search text.
-    //   * If a matching character from the search text was found at the start
-    //     of a word in the name, then we increment the weight again.
-    //     * For example, for a search string "sp", we want "Split Pane" to
-    //       appear in the list before "Close Pane"
-    // Arguments:
-    // - searchText: the string of text to search for in `name`
-    // - name: the name to check
-    // Return Value:
     // - the relative weight of this match
     int CommandPalette::_getWeight(const winrt::hstring& searchText,
                                    const winrt::hstring& name)
     {
-        std::wstring lowercaseSearchText{ searchText.c_str() };
-        std::wstring lowercaseName{ name.c_str() };
-        std::transform(lowercaseSearchText.begin(), lowercaseSearchText.end(), lowercaseSearchText.begin(), std::towlower);
-        std::transform(lowercaseName.begin(), lowercaseName.end(), lowercaseName.begin(), std::towlower);
-
         int totalWeight = 0;
-        bool lastCharWasSpace = true;
-        const wchar_t* namePtr = lowercaseName.c_str();
-        const wchar_t* endOfName = lowercaseName.c_str() + lowercaseName.size();
-        for (const auto& wch : lowercaseSearchText)
+        bool lastWasSpace = true;
+
+        auto it = name.cbegin();
+
+        for (auto searchChar : searchText)
         {
-            while (wch != *namePtr)
+            searchChar = std::towlower(searchChar);
+            // Advance the iterator to the next character that we're looking
+            // for.
+
+            bool lastWasMatch = true;
+            while (true)
             {
-                // increment the character to look at in the name string
-                namePtr++;
-                if (namePtr >= endOfName)
+                // If we are at the end of the name string, we haven't found
+                // it.
+                if (it == name.cend())
                 {
-                    // If we are at the end of the name string, we haven't found all the search chars
-                    return totalWeight;
+                    return false;
                 }
-                lastCharWasSpace = *namePtr == L' ';
+
+                // found it
+                if (std::towlower(*it) == searchChar)
+                {
+                    break;
+                }
+
+                lastWasSpace = *it == L' ';
+                ++it;
+                lastWasMatch = false;
             }
 
-            // We found the char, increment weight
-            totalWeight++;
-            totalWeight += lastCharWasSpace ? 1 : 0;
+            // Advance the iterator by one character so that we don't
+            // end up on the same character in the next iteration.
+            ++it;
+
+            totalWeight += 1;
+            totalWeight += lastWasSpace ? 1 : 0;
+            totalWeight += (lastWasMatch) ? 1 : 0;
         }
+
         return totalWeight;
     }
 
